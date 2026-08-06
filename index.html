@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>点对点群聊</title>
+  <link rel="icon" href="data:,">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #f4f6fb;
+      --card: #ffffff;
+      --text: #1f2430;
+      --muted: #8a93a6;
+      --accent: #3b82f6;
+      --accent-dark: #2563eb;
+      --mine: #3b82f6;
+      --other: #eef1f7;
+      --border: #e5e9f2;
+      --danger: #ef4444;
+    }
+    html, body { height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .hidden { display: none !important; }
+
+    /* Login */
+    .login {
+      width: min(92vw, 420px);
+      background: var(--card);
+      border-radius: 16px;
+      box-shadow: 0 12px 40px rgba(31, 41, 55, .12);
+      padding: 40px 36px;
+    }
+    .login h1 { font-size: 24px; margin-bottom: 6px; letter-spacing: 1px; }
+    .login .sub { color: var(--muted); font-size: 13px; margin-bottom: 28px; line-height: 1.6; }
+    .login label { display: block; font-size: 13px; color: var(--muted); margin: 14px 0 6px; }
+    .login input {
+      width: 100%;
+      padding: 11px 14px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-size: 15px;
+      outline: none;
+      transition: border-color .15s;
+    }
+    .login input:focus { border-color: var(--accent); }
+    .login .err { color: var(--danger); font-size: 13px; margin-top: 14px; min-height: 18px; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      border: none;
+      border-radius: 10px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      padding: 11px 18px;
+      transition: background .15s;
+    }
+    .btn:hover { background: var(--accent-dark); }
+    .login .btn { width: 100%; margin-top: 18px; }
+    .login .tip { color: var(--muted); font-size: 12px; margin-top: 16px; line-height: 1.7; }
+
+    /* Chat */
+    .chat {
+      display: grid;
+      grid-template-rows: 56px 1fr;
+      width: min(96vw, 900px);
+      height: min(94vh, 760px);
+      background: var(--card);
+      border-radius: 16px;
+      box-shadow: 0 12px 40px rgba(31, 41, 55, .12);
+      overflow: hidden;
+    }
+    .chat .head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 18px;
+      border-bottom: 1px solid var(--border);
+    }
+    .head .dot-live { width: 9px; height: 9px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 0 3px rgba(34,197,94,.18); }
+    .head .title { font-weight: 600; font-size: 16px; }
+    .head .status { font-size: 12px; color: var(--muted); }
+    .head .spacer { flex: 1; }
+    .head .online { font-size: 13px; color: var(--muted); }
+    .head .btn.ghost { background: transparent; color: var(--accent); border: 1px solid var(--border); font-size: 13px; padding: 7px 12px; }
+    .head .btn.ghost:hover { background: #eff6ff; border-color: var(--accent); }
+
+    .body { display: grid; grid-template-columns: 1fr 210px; min-height: 0; }
+    .main { display: flex; flex-direction: column; min-width: 0; }
+    .messages { flex: 1; overflow-y: auto; padding: 18px 18px 6px; }
+    .msg { margin-bottom: 14px; max-width: 76%; }
+    .msg .meta { font-size: 12px; color: var(--muted); margin-bottom: 4px; padding: 0 2px; }
+    .msg .bubble {
+      display: inline-block;
+      padding: 9px 13px;
+      border-radius: 14px;
+      font-size: 14.5px;
+      line-height: 1.55;
+      word-break: break-word;
+      white-space: pre-wrap;
+    }
+    .msg.other .bubble { background: var(--other); border-top-left-radius: 4px; }
+    .msg.mine { margin-left: auto; text-align: right; }
+    .msg.mine .bubble { background: var(--mine); color: #fff; border-top-right-radius: 4px; }
+    .msg.sys { max-width: 100%; text-align: center; margin: 10px 0; }
+    .msg.sys span {
+      display: inline-block;
+      background: #eef2f9;
+      color: var(--muted);
+      font-size: 12px;
+      padding: 4px 12px;
+      border-radius: 20px;
+    }
+    .inputbar {
+      display: flex;
+      gap: 10px;
+      padding: 12px 16px;
+      border-top: 1px solid var(--border);
+    }
+    .inputbar input {
+      flex: 1;
+      padding: 10px 14px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-size: 14.5px;
+      outline: none;
+    }
+    .inputbar input:focus { border-color: var(--accent); }
+
+    .side {
+      border-left: 1px solid var(--border);
+      padding: 16px 14px;
+      overflow-y: auto;
+      background: #fafbfe;
+    }
+    .side h3 { font-size: 13px; color: var(--muted); font-weight: 600; margin-bottom: 12px; }
+    .member {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 7px 6px;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    .member .dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; flex: none; }
+    .member.me .mname { color: var(--accent); font-weight: 600; }
+    .member .mname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    @media (max-width: 700px) {
+      .body { grid-template-columns: 1fr; }
+      .side { display: none; }
+      .msg { max-width: 88%; }
+    }
+  </style>
+</head>
+<body>
+  <!-- 登录 -->
+  <div id="login-screen" class="login">
+    <h1>点对点群聊</h1>
+    <div class="sub">无需注册登录，填写昵称即可开始。同一房间内昵称唯一，不可重复。</div>
+    <label for="username">昵称（唯一，不能重复）</label>
+    <input id="username" type="text" maxlength="20" placeholder="例如：小明" autocomplete="off">
+    <label for="room">房间名（可选，默认 global）</label>
+    <input id="room" type="text" maxlength="40" placeholder="例如：家庭群 / 工作群" autocomplete="off">
+    <div id="login-error" class="err"></div>
+    <button id="join-btn" class="btn">进入群聊</button>
+    <div class="tip">点对点（WebRTC）传输，消息直连用户之间，不经过服务器存储。</div>
+  </div>
+
+  <!-- 聊天 -->
+  <div id="chat-screen" class="chat hidden">
+    <div class="head">
+      <span class="dot-live"></span>
+      <span id="room-title" class="title">global</span>
+      <span id="status-text" class="status">正在连接……</span>
+      <span class="spacer"></span>
+      <span class="online">在线 <span id="member-count">0</span> 人</span>
+      <button id="leave-btn" class="btn ghost">退出</button>
+    </div>
+    <div class="body">
+      <div class="main">
+        <div id="messages" class="messages"></div>
+        <div class="inputbar">
+          <input id="message-input" type="text" maxlength="2000" placeholder="输入消息，回车发送" autocomplete="off">
+          <button id="send-btn" class="btn">发送</button>
+        </div>
+      </div>
+      <div class="side">
+        <h3>在线成员</h3>
+        <div id="members-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="./bundle.js"></script>
+</body>
+</html>
