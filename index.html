@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>点对点群聊</title>
+  <title>群聊</title>
   <link rel="icon" href="data:,">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -138,6 +138,44 @@
       outline: none;
     }
     .inputbar input:focus { border-color: var(--accent); }
+    .img-btn {
+      background: transparent;
+      color: var(--accent);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0 14px;
+      font-size: 18px;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .img-btn:hover { background: #eff6ff; border-color: var(--accent); }
+
+    .msg .bubble-img {
+      display: block;
+      max-width: 260px;
+      max-height: 260px;
+      border-radius: 10px;
+      cursor: zoom-in;
+      border: 1px solid var(--border);
+    }
+    .msg.mine .bubble-img { border-color: transparent; }
+
+    #toast {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #1f2430;
+      color: #fff;
+      border-radius: 20px;
+      padding: 8px 18px;
+      font-size: 13px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .25s;
+      z-index: 100;
+    }
+    #toast.show { opacity: 1; }
 
     .side {
       border-left: 1px solid var(--border);
@@ -168,7 +206,7 @@
 <body>
   <!-- 登录 -->
   <div id="login-screen" class="login">
-    <h1>点对点群聊</h1>
+    <h1>群聊</h1>
     <div class="sub">无需注册登录，填写昵称即可开始。同一房间内昵称唯一，不可重复。</div>
     <label for="username">昵称（唯一，不能重复）</label>
     <input id="username" type="text" maxlength="20" placeholder="例如：小明" autocomplete="off">
@@ -176,7 +214,7 @@
     <input id="room" type="text" maxlength="40" placeholder="例如：家庭群 / 工作群" autocomplete="off">
     <div id="login-error" class="err"></div>
     <button id="join-btn" class="btn">进入群聊</button>
-    <div class="tip">点对点（WebRTC）传输，消息直连用户之间，不经过服务器存储。</div>
+    <div class="tip">基于消息服务器的多人群聊，支持文字与图片。</div>
   </div>
 
   <!-- 聊天 -->
@@ -193,6 +231,8 @@
       <div class="main">
         <div id="messages" class="messages"></div>
         <div class="inputbar">
+          <button id="img-btn" class="img-btn" title="发送图片">🖼</button>
+          <input id="img-input" type="file" accept="image/*" hidden>
           <input id="message-input" type="text" maxlength="2000" placeholder="输入消息，回车发送" autocomplete="off">
           <button id="send-btn" class="btn">发送</button>
         </div>
@@ -204,6 +244,7 @@
     </div>
   </div>
 
+  <div id="toast"></div>
   <script src="./bundle.js"></script>
 </body>
 </html>
