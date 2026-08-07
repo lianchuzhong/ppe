@@ -43,6 +43,7 @@ let lastSeen = new Map()
 let cryptoKey = null
 let decryptedCache = new Map()
 let decrypting = new Set()
+let seenIds = new Set()
 let heartbeatTimer = null
 let cleanupTimer = null
 
@@ -240,7 +241,11 @@ function onMessage(topic, payload) {
   if (topic === topicFor('chat')) {
     try {
       const m = JSON.parse(str)
-      if (m && m.id) { messages.push(m); renderChat() }
+      if (m && m.id && !seenIds.has(m.id)) {
+        seenIds.add(m.id)
+        messages.push(m)
+        renderChat()
+      }
     } catch (_) {}
   }
 }
@@ -319,6 +324,7 @@ async function publishMessage(extra) {
     wire = Object.assign(base, extra)
   }
   messages.push(wire)
+  seenIds.add(wire.id)
   if (cryptoKey) decryptedCache.set(wire.id, extra)
   client.publish(topicFor('chat'), JSON.stringify(wire), { qos: 0 })
   renderChat()
@@ -471,6 +477,7 @@ function teardown() {
   cryptoKey = null
   decryptedCache = new Map()
   decrypting = new Set()
+  seenIds = new Set()
   messageInput.value = ''
   messagesBox.textContent = ''
   membersList.textContent = ''
