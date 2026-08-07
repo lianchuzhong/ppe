@@ -1,10 +1,15 @@
-import * as Y from 'yjs'
-import { WebrtcProvider } from 'y-webrtc'
+import mqtt from 'mqtt'
 
-const SIGNALING = ['wss://signaling.yjs.dev']
+const BROKERS = [
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
+]
+const ROOM_PREFIX = 'succession/'
 const MAX_RENDER = 200
-const STALE_MS = 20000
-const RECLAIM_STALE_MS = 10000
+const HEARTBEAT_MS = 8000
+const STALE_MS = 25000
+const IMG_MAX_DIM = 900
+const IMG_MAX_BYTES = 500 * 1024
 
 const $ = (id) => document.getElementById(id)
 
@@ -20,20 +25,22 @@ const roomTitle = $('room-title')
 const messagesBox = $('messages')
 const messageInput = $('message-input')
 const sendBtn = $('send-btn')
+const imgBtn = $('img-btn')
+const imgInput = $('img-input')
 const leaveBtn = $('leave-btn')
 const statusText = $('status-text')
 
-let doc = null
-let provider = null
-let messages = null
-let names = null
+let client = null
+let room = null
 let myName = null
 let myClientId = null
 let entered = false
-let pendingStart = false
-let cleanupTimer = null
 let sysLog = []
-let prevOnline = new Map()
+let messages = []
+let online = new Map()
+let lastSeen = new Map()
+let heartbeatTimer = null
+let cleanupTimer = null
 
 function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
@@ -43,27 +50,12 @@ function timeStr(t) {
   return new Date(t).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 }
 
-function onlineIds() {
-  return provider ? new Set(provider.awareness.getStates().keys()) : new Set()
+function topicFor(kind) {
+  return ROOM_PREFIX + room + '/' + kind
 }
 
-function onlineNames() {
-  const seen = new Map()
-  if (!provider) return seen
-  for (const [id, state] of provider.awareness.getStates()) {
-    const n = state && state.user && state.user.name
-    if (n) seen.set(id, n)
-  }
-  return seen
-}
-
-function ownName(name) {
-  const v = names.get(name)
-  return !!(v && v.id === myClientId)
-}
-
-function removeMyName() {
-  if (names && myName && ownName(myName)) names.delete(myName)
+function presenceTopic(id) {
+  return topicFor('presence') + '/' + id
 }
 
 function sanitizeRoom(raw) {
@@ -83,132 +75,125 @@ function showLoginError(msg) {
   loginError.classList.remove('hidden')
 }
 
+function setStatus(text, ok) {
+  statusText.textContent = text
+  statusText.className = 'status ' + (ok ? 'ok' : '')
+}
+
 function startChat() {
   const nameErr = validateName(usernameInput.value)
   if (nameErr) { showLoginError(nameErr); return }
-  if (pendingStart) return
-  pendingStart = true
-  loginError.classList.add('hidden')
 
-  const name = usernameInput.value.trim()
-  const room = sanitizeRoom(roomInput.value)
+  room = sanitizeRoom(roomInput.value)
+  myName = usernameInput.value.trim()
+  myClientId = uid()
+  entered = false
 
-  doc = new Y.Doc()
-  provider = new WebrtcProvider(room, doc, { signaling: SIGNALING })
-  messages = doc.getArray('messages')
-  names = doc.getMap('names')
-  myClientId = provider.awareness.clientID
-  myName = name
-
-  messages.observe(() => renderChat())
-  provider.awareness.on('change', onAwarenessChange)
-  provider.on('sync', (isSynced) => { if (isSynced) tryEnter() })
-  setTimeout(tryEnter, 4000)
-
-  statusText.textContent = '正在连接……'
-  roomTitle.textContent = room
   loginScreen.classList.add('hidden')
   chatScreen.classList.remove('hidden')
+  roomTitle.textContent = room
   messageInput.focus()
+  setStatus('正在连接……', false)
 
-  cleanupTimer = setInterval(cleanupStaleNames, 5000)
+  client = mqtt.connect(BROKERS[0], {
+    clientId: 'succ-' + myClientId,
+    reconnectPeriod: 2000,
+    connectTimeout: 15000,
+    will: {
+      topic: presenceTopic(myClientId),
+      payload: JSON.stringify({ name: myName, online: false, t: Date.now() }),
+      qos: 1,
+      retain: true,
+    },
+  })
+
+  client.on('connect', onConnect)
+  client.on('reconnect', () => setStatus('重连中……', false))
+  client.on('close', () => { if (entered) setStatus('连接断开，正在重连', false) })
+  client.on('error', () => {})
+  client.on('message', onMessage)
+}
+
+function onConnect() {
+  if (!client) return
+  client.subscribe(topicFor('chat'))
+  client.subscribe(topicFor('presence') + '/+')
+  announce()
+  heartbeatTimer = setInterval(announce, HEARTBEAT_MS)
+  cleanupTimer = setInterval(cleanupStale, 5000)
+  setStatus('已连接 · 群聊中', true)
+  setTimeout(checkNameConflict, 3000)
   renderChat()
 }
 
-function attemptClaim(name) {
-  const current = names.get(name)
-  if (current) {
-    if (current.id === myClientId) return true
-    const ownerOnline = onlineIds().has(current.id)
-    const stale = Date.now() - current.t > RECLAIM_STALE_MS
-    if (!ownerOnline && stale) {
-      names.set(name, { id: myClientId, t: Date.now() })
-      return true
-    }
-    return false
-  }
-  names.set(name, { id: myClientId, t: Date.now() })
-  return true
+function announce() {
+  if (!client) return
+  client.publish(presenceTopic(myClientId), JSON.stringify({
+    name: myName, online: true, t: Date.now()
+  }), { qos: 1, retain: true })
+  lastSeen.set(myClientId, Date.now())
 }
 
-function tryEnter() {
-  if (!provider || entered) return
-  if (attemptClaim(myName)) {
-    entered = true
-    pendingStart = false
-    provider.awareness.setLocalState({ user: { name: myName } })
-    prevOnline = onlineNames()
-    statusText.textContent = '已连接 · 点对点加密'
-    updateOnline()
-  } else {
+function checkNameConflict() {
+  if (!entered && myName && onlineHas(myName)) {
     failEnter('该昵称已被占用，请换一个名字')
+    return
+  }
+  entered = true
+}
+
+function onlineHas(name) {
+  for (const [id, n] of online) {
+    if (id !== myClientId && n === name) return true
+  }
+  return false
+}
+
+function onMessage(topic, payload) {
+  const str = payload.toString()
+  if (topic.indexOf('/presence/') !== -1) {
+    handlePresence(topic, str)
+    return
+  }
+  if (topic === topicFor('chat')) {
+    try {
+      const m = JSON.parse(str)
+      if (m && m.id) { messages.push(m); renderChat() }
+    } catch (_) {}
   }
 }
 
-function failEnter(msg) {
-  if (!pendingStart && !entered) return
-  showLoginError(msg)
-  teardown()
-  loginScreen.classList.remove('hidden')
-  chatScreen.classList.add('hidden')
-}
-
-function teardown() {
-  if (cleanupTimer) { clearInterval(cleanupTimer); cleanupTimer = null }
-  if (provider) {
-    provider.awareness.setLocalState(null)
-    removeMyName()
-    try { provider.destroy() } catch (_) {}
+function handlePresence(topic, str) {
+  let p
+  try { p = JSON.parse(str) } catch (_) { return }
+  if (!p || typeof p.name !== 'string') return
+  const id = topic.slice(topic.lastIndexOf('/') + 1)
+  lastSeen.set(id, Date.now())
+  if (p.online) {
+    if (!online.has(id) && id !== myClientId) pushSys(`${p.name} 加入了群聊`)
+    online.set(id, p.name)
+  } else {
+    const gone = online.get(id)
+    if (gone && id !== myClientId) pushSys(`${gone} 离开了群聊`)
+    online.delete(id)
   }
-  if (doc) { try { doc.destroy() } catch (_) {} }
-  provider = null
-  doc = null
-  messages = null
-  names = null
-  myName = null
-  myClientId = null
-  entered = false
-  pendingStart = false
-  sysLog = []
-  prevOnline = new Map()
-  messageInput.value = ''
-  messagesBox.textContent = ''
-  membersList.textContent = ''
+  updateOnline()
 }
 
-function sendMessage() {
-  const text = messageInput.value.trim()
-  if (!text || !messages) return
-  messages.push([{ id: uid(), sender: myName, text, t: Date.now() }])
-  messageInput.value = ''
-  messageInput.focus()
-}
-
-function pushSys(text) {
-  sysLog.push({ sys: true, text, t: Date.now() })
-  sysLog = sysLog.slice(-30)
-  renderChat()
-}
-
-function onAwarenessChange(change) {
-  if (!entered) return
-  for (const id of change.added || []) {
-    const st = provider.awareness.getStates().get(id)
-    const n = st && st.user && st.user.name
-    if (n && n !== myName) pushSys(`${n} 加入了群聊`)
+function cleanupStale() {
+  const now = Date.now()
+  for (const [id, seen] of lastSeen) {
+    if (id !== myClientId && now - seen > STALE_MS && online.has(id)) {
+      const n = online.get(id)
+      online.delete(id)
+      pushSys(`${n} 离开了群聊`)
+    }
   }
-  for (const id of change.removed || []) {
-    const n = prevOnline.get(id)
-    if (n && n !== myName) pushSys(`${n} 离开了群聊`)
-  }
-  prevOnline = onlineNames()
   updateOnline()
 }
 
 function updateOnline() {
-  if (!provider) return
-  const namesMap = onlineNames()
-  const list = [...namesMap.values()]
+  const list = [...online.values()]
   membersList.textContent = ''
   const frag = document.createDocumentFragment()
   for (const n of list) {
@@ -227,12 +212,75 @@ function updateOnline() {
   memberCountEl.textContent = String(list.length)
 }
 
+function pushSys(text) {
+  sysLog.push({ sys: true, text, t: Date.now() })
+  sysLog = sysLog.slice(-30)
+  renderChat()
+}
+
+function sendMessage() {
+  const text = messageInput.value.trim()
+  if (!text || !client || !entered) return
+  publishMessage({ text })
+  messageInput.value = ''
+  messageInput.focus()
+}
+
+function publishMessage(extra) {
+  const m = Object.assign({
+    id: uid(), sender: myName, text: '', t: Date.now()
+  }, extra)
+  messages.push(m)
+  client.publish(topicFor('chat'), JSON.stringify(m), { qos: 0 })
+  renderChat()
+}
+
+function sendImage(file) {
+  if (!file || !client || !entered) return
+  if (!/^image\//.test(file.type)) { toast('请选择图片文件'); return }
+  const reader = new FileReader()
+  reader.onload = () => {
+    compressImage(reader.result).then((dataUrl) => {
+      if (dataUrl) publishMessage({ img: dataUrl })
+    })
+  }
+  reader.readAsDataURL(file)
+}
+
+function compressImage(dataUrl) {
+  return new Promise((resolve) => {
+    const img = new Image()
+    img.onload = () => {
+      let { width, height } = img
+      const scale = Math.min(1, IMG_MAX_DIM / Math.max(width, height))
+      width = Math.round(width * scale)
+      height = Math.round(height * scale)
+      const canvas = document.createElement('canvas')
+      canvas.width = width
+      canvas.height = height
+      const ctx = canvas.getContext('2d')
+      ctx.fillStyle = '#fff'
+      ctx.fillRect(0, 0, width, height)
+      ctx.drawImage(img, 0, 0, width, height)
+      let quality = 0.82
+      let out = canvas.toDataURL('image/jpeg', quality)
+      while (out.length > IMG_MAX_BYTES && quality > 0.3) {
+        quality -= 0.08
+        out = canvas.toDataURL('image/jpeg', quality)
+      }
+      resolve(out)
+    }
+    img.onerror = () => resolve(null)
+    img.src = dataUrl
+  })
+}
+
 function renderChat() {
-  if (!messages) return
+  if (!messagesBox) return
   const box = messagesBox
   const wasAtBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 24
   const items = []
-  for (const m of messages.toArray()) items.push(m)
+  for (const m of messages) items.push(m)
   for (const s of sysLog) items.push(s)
   items.sort((a, b) => (a.t || 0) - (b.t || 0))
   const slice = items.slice(-MAX_RENDER)
@@ -257,33 +305,68 @@ function renderMessageNode(m) {
   const meta = document.createElement('div')
   meta.className = 'meta'
   meta.textContent = `${m.sender} · ${timeStr(m.t)}`
-  const bubble = document.createElement('div')
-  bubble.className = 'bubble'
-  bubble.textContent = m.text
   wrap.appendChild(meta)
-  wrap.appendChild(bubble)
+  if (m.img) {
+    const a = document.createElement('a')
+    a.href = m.img
+    a.target = '_blank'
+    a.rel = 'noopener'
+    const img = document.createElement('img')
+    img.className = 'bubble-img'
+    img.src = m.img
+    img.alt = '图片'
+    a.appendChild(img)
+    wrap.appendChild(a)
+  } else {
+    const bubble = document.createElement('div')
+    bubble.className = 'bubble'
+    bubble.textContent = m.text
+    wrap.appendChild(bubble)
+  }
   return wrap
 }
 
-function cleanupStaleNames() {
-  if (!names) return
-  const now = Date.now()
-  for (const [name, v] of names) {
-    if (v.id === myClientId) continue
-    if (!onlineIds().has(v.id) && now - v.t > STALE_MS) {
-      names.delete(name)
-    }
-  }
+function failEnter(msg) {
+  showLoginError(msg)
+  teardown()
+  loginScreen.classList.remove('hidden')
+  chatScreen.classList.add('hidden')
 }
 
-setInterval(() => {
-  if (entered && myName && names) {
-    const cur = names.get(myName)
-    if (!cur || cur.id !== myClientId) {
-      failEnter('该昵称已被占用，请换一个名字')
-    }
+function teardown() {
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null }
+  if (cleanupTimer) { clearInterval(cleanupTimer); cleanupTimer = null }
+  if (client) {
+    try {
+      client.publish(presenceTopic(myClientId), JSON.stringify({
+        name: myName, online: false, t: Date.now()
+      }), { qos: 1, retain: true })
+      client.end(true)
+    } catch (_) {}
   }
-}, 3000)
+  client = null
+  room = null
+  myName = null
+  myClientId = null
+  entered = false
+  sysLog = []
+  messages = []
+  online = new Map()
+  lastSeen = new Map()
+  messageInput.value = ''
+  messagesBox.textContent = ''
+  membersList.textContent = ''
+}
+
+let toastTimer = null
+function toast(msg) {
+  const el = $('toast')
+  if (!el) return
+  el.textContent = msg
+  el.classList.add('show')
+  if (toastTimer) clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2500)
+}
 
 joinBtn.addEventListener('click', startChat)
 leaveBtn.addEventListener('click', () => {
@@ -295,6 +378,11 @@ messageInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); sendMessage() }
 })
 sendBtn.addEventListener('click', sendMessage)
+imgBtn.addEventListener('click', () => imgInput.click())
+imgInput.addEventListener('change', () => {
+  if (imgInput.files && imgInput.files[0]) sendImage(imgInput.files[0])
+  imgInput.value = ''
+})
 for (const el of [usernameInput, roomInput]) {
   el.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); startChat() }
