@@ -7,8 +7,8 @@
     "build": "esbuild src/app.js --bundle --minify --format=iife --outfile=bundle.js"
   },
   "dependencies": {
-    "y-webrtc": "^10.3.0",
-    "yjs": "^13.6.0"
+    "mqtt": "^5.15.2",
+    "puppeteer-core": "^25.5.0"
   },
   "devDependencies": {
     "esbuild": "^0.24.0"
