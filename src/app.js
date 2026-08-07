@@ -98,6 +98,34 @@ async function decryptData(m) {
   } catch (_) { return null }
 }
 
+const WORDS = ('ahead amber apple atlas bacon badge baker bamboo beacon bear berry birch bliss bloom ' +
+  'blue bolt bonus book brave breeze brick bright bronze brush cable cabin cactus camel candy canoe ' +
+  'canyon cargo cedar charm cherry chess chunk civic cloud clover cobra cocoa comet comic coral cosmic ' +
+  'cotton cricket crystal curve cycle daisy dancer dawn delta denim desert diamond diver dolphin dragon ' +
+  'drift drum eagle ember emerald engine feather fern field finch flame flint flock flower foam forest ' +
+  'fossil fox frost galaxy garden gem ginger glacier glow gold gopher grape gravel guitar harbor hazel ' +
+  'helix heron honey horizon ibex icicle igloo indigo island ivory jade jaguar jasmine jetty jigsaw ' +
+  'jungle kayak koala lagoon lantern laurel lemon leopard lilac lime lion lotus lynx magnet maple marble ' +
+  'meadow melon meteor mint mirror mist moon moose moss moth mountain navy nebula nickel night ocean ' +
+  'olive onion opal orange orchid otter oyster paddle palace palm panel paper parrot pearl pepper piano ' +
+  'pika pilot pine pirate planet plaza plum pond pony poppy prism puma quartz rabbit raven reed reef ' +
+  'ribbon ridge river robin rocket rose ruby sail salmon sand sapphire scarf shadow shell shine silver ' +
+  'skunk slate smoke snow sock spark sparrow spice spider spring squash squirrel stone storm sugar ' +
+  'sunrise sunset swift tangerine teal tiger timber toast tomato topaz torch trail tulip turtle valley ' +
+  'velvet violet walnut wander water willow wind winter wolf zebra zephyr').split(' ')
+
+function randInt(max) {
+  const arr = new Uint32Array(1)
+  crypto.getRandomValues(arr)
+  return arr[0] % max
+}
+
+function randomPassphrase() {
+  const w = []
+  for (let i = 0; i < 4; i++) w.push(WORDS[randInt(WORDS.length)])
+  return w.join('-') + '-' + (100 + randInt(900))
+}
+
 function topicFor(kind) {
   return ROOM_PREFIX + room + '/' + kind
 }
@@ -459,6 +487,17 @@ function toast(msg) {
 }
 
 joinBtn.addEventListener('click', startChat)
+$('gen-btn').addEventListener('click', () => {
+  const p = randomPassphrase()
+  passwordInput.value = p
+  try { navigator.clipboard.writeText(p) } catch (_) {}
+  toast('已生成随机口令并复制，请分享给群成员')
+})
+$('show-btn').addEventListener('click', () => {
+  const shown = passwordInput.type === 'text'
+  passwordInput.type = shown ? 'password' : 'text'
+  $('show-btn').textContent = shown ? '👁' : '🙈'
+})
 leaveBtn.addEventListener('click', () => {
   teardown()
   loginScreen.classList.remove('hidden')

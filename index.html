@@ -51,6 +51,19 @@
       transition: border-color .15s;
     }
     .login input:focus { border-color: var(--accent); }
+    .login .pwrow { display: flex; gap: 8px; }
+    .login .pwrow input { flex: 1; min-width: 0; }
+    .login .btn.ghost {
+      background: #fff;
+      color: var(--accent);
+      border: 1px solid var(--border);
+      font-size: 13px;
+      padding: 0 14px;
+      width: auto;
+      flex: none;
+      margin-top: 0;
+    }
+    .login .btn.ghost:hover { background: #eff6ff; border-color: var(--accent); }
     .login .err { color: var(--danger); font-size: 13px; margin-top: 14px; min-height: 18px; }
     .btn {
       display: inline-flex;
@@ -213,7 +226,11 @@
     <label for="room">房间名（可选，默认 global）</label>
     <input id="room" type="text" maxlength="40" placeholder="例如：家庭群 / 工作群" autocomplete="off">
     <label for="password">房间密码（可选）</label>
-    <input id="password" type="password" maxlength="64" placeholder="加密口令，不填则不加密" autocomplete="off">
+    <div class="pwrow">
+      <input id="password" type="password" maxlength="64" placeholder="加密口令，不填则不加密" autocomplete="off">
+      <button id="gen-btn" class="btn ghost" type="button" title="生成随机口令">🎲 随机</button>
+      <button id="show-btn" class="btn ghost" type="button" title="显示 / 隐藏口令">👁</button>
+    </div>
     <div id="login-error" class="err"></div>
     <button id="join-btn" class="btn">进入群聊</button>
     <div class="tip">基于消息服务器的多人群聊，支持文字与图片。填写相同的房间密码即可对消息端到端加密，服务器与偷听者只能看到密文。</div>
