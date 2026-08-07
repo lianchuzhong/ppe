@@ -396,6 +396,7 @@ function renderChat() {
 }
 
 function messageContent(m) {
+  if (m.img != null) return { img: m.img }
   if (m.text != null) return { text: m.text }
   if (m.data) {
     if (decryptedCache.has(m.id)) {
