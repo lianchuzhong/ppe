@@ -30,6 +30,7 @@ const imgBtn = $('img-btn')
 const imgInput = $('img-input')
 const leaveBtn = $('leave-btn')
 const statusText = $('status-text')
+const mentionBox = $('mention-box')
 
 let client = null
 let room = null
@@ -44,6 +45,9 @@ let cryptoKey = null
 let decryptedCache = new Map()
 let decrypting = new Set()
 let seenIds = new Set()
+let mentionState = null
+let mentionItems = []
+let mentionSel = -1
 let heartbeatTimer = null
 let cleanupTimer = null
 
@@ -291,12 +295,17 @@ function updateOnline() {
     const label = document.createElement('span')
     label.className = 'mname'
     label.textContent = n + (n === myName ? '（我）' : '')
+    if (n !== myName) {
+      label.title = '点击 @' + n
+      label.addEventListener('click', () => appendMention(n))
+    }
     li.appendChild(dot)
     li.appendChild(label)
     frag.appendChild(li)
   }
   membersList.appendChild(frag)
   memberCountEl.textContent = String(list.length)
+  updateMentionBox()
 }
 
 function pushSys(text) {
@@ -409,6 +418,87 @@ async function decryptAsync(m) {
   renderChat()
 }
 
+function updateMentionBox() {
+  if (!mentionBox) return
+  const val = messageInput.value
+  const caret = messageInput.selectionStart == null ? val.length : messageInput.selectionStart
+  const at = val.lastIndexOf('@', caret - 1)
+  if (at === -1) { hideMention(); return }
+  const word = val.slice(at + 1, caret)
+  if (/[\s@]/.test(word)) { hideMention(); return }
+  const q = word.toLowerCase()
+  const names = [...online.values()].filter((n) => n !== myName && n.toLowerCase().includes(q))
+  if (names.length === 0) { hideMention(); return }
+  mentionState = { at, word }
+  mentionItems = names
+  mentionSel = 0
+  mentionBox.textContent = ''
+  const frag = document.createDocumentFragment()
+  for (let i = 0; i < names.length; i++) {
+    const item = document.createElement('div')
+    item.className = 'mitem' + (i === 0 ? ' sel' : '')
+    item.textContent = '@' + names[i]
+    item.addEventListener('click', () => insertMention(names[i]))
+    frag.appendChild(item)
+  }
+  mentionBox.appendChild(frag)
+  mentionBox.classList.remove('hidden')
+}
+
+function hideMention() {
+  if (!mentionBox) return
+  mentionBox.classList.add('hidden')
+  mentionBox.textContent = ''
+  mentionState = null
+  mentionItems = []
+  mentionSel = -1
+}
+
+function insertMention(name) {
+  if (!mentionState) { appendMention(name); return }
+  const val = messageInput.value
+  const end = mentionState.at + 1 + mentionState.word.length
+  messageInput.value = val.slice(0, mentionState.at) + '@' + name + ' ' + val.slice(end)
+  hideMention()
+  messageInput.focus()
+  const pos = mentionState.at + name.length + 2
+  messageInput.setSelectionRange(pos, pos)
+}
+
+function appendMention(name) {
+  const val = messageInput.value
+  const pos = messageInput.selectionStart == null ? val.length : messageInput.selectionStart
+  const ins = '@' + name + ' '
+  messageInput.value = val.slice(0, pos) + ins + val.slice(pos)
+  hideMention()
+  messageInput.focus()
+  messageInput.setSelectionRange(pos + ins.length, pos + ins.length)
+}
+
+function moveMention(dir) {
+  if (mentionItems.length === 0) return
+  mentionSel = (mentionSel + dir + mentionItems.length) % mentionItems.length
+  const items = mentionBox.querySelectorAll('.mitem')
+  items.forEach((el, i) => el.classList.toggle('sel', i === mentionSel))
+}
+
+function renderTextWithMentions(text) {
+  const frag = document.createDocumentFragment()
+  const re = /@([^\s@]+)/g
+  let last = 0
+  let m
+  while ((m = re.exec(text))) {
+    if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)))
+    const span = document.createElement('span')
+    span.className = 'mention'
+    span.textContent = m[0]
+    frag.appendChild(span)
+    last = m.index + m[0].length
+  }
+  if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)))
+  return frag
+}
+
 function renderMessageNode(m) {
   const wrap = document.createElement('div')
   if (m.sys) {
@@ -426,6 +516,8 @@ function renderMessageNode(m) {
   wrap.appendChild(meta)
   const c = messageContent(m)
   if (c.img) {
+    const block = document.createElement('div')
+    block.className = 'img-block'
     const a = document.createElement('a')
     a.href = c.img
     a.target = '_blank'
@@ -435,13 +527,30 @@ function renderMessageNode(m) {
     img.src = c.img
     img.alt = '图片'
     a.appendChild(img)
-    wrap.appendChild(a)
+    block.appendChild(a)
+    const actions = document.createElement('div')
+    actions.className = 'img-actions'
+    const save = document.createElement('button')
+    save.type = 'button'
+    save.className = 'img-save'
+    save.textContent = '保存图片'
+    save.addEventListener('click', () => {
+      const dl = document.createElement('a')
+      dl.href = c.img
+      dl.download = 'image-' + (m.id || Date.now()) + '.jpg'
+      document.body.appendChild(dl)
+      dl.click()
+      dl.remove()
+    })
+    actions.appendChild(save)
+    block.appendChild(actions)
+    wrap.appendChild(block)
   } else {
     const bubble = document.createElement('div')
     bubble.className = 'bubble'
     if (c.failed) bubble.textContent = '[加密消息 · 密码不匹配，无法解密]'
     else if (c.pending) bubble.textContent = '正在解密…'
-    else bubble.textContent = c.text
+    else bubble.appendChild(renderTextWithMentions(c.text))
     wrap.appendChild(bubble)
   }
   return wrap
@@ -478,6 +587,7 @@ function teardown() {
   decryptedCache = new Map()
   decrypting = new Set()
   seenIds = new Set()
+  hideMention()
   messageInput.value = ''
   messagesBox.textContent = ''
   membersList.textContent = ''
@@ -511,8 +621,19 @@ leaveBtn.addEventListener('click', () => {
   chatScreen.classList.add('hidden')
 })
 messageInput.addEventListener('keydown', (e) => {
+  if (mentionState) {
+    if (e.key === 'ArrowDown') { e.preventDefault(); moveMention(1); return }
+    if (e.key === 'ArrowUp') { e.preventDefault(); moveMention(-1); return }
+    if (e.key === 'Tab' || e.key === 'Enter') {
+      e.preventDefault()
+      if (mentionItems[mentionSel]) insertMention(mentionItems[mentionSel])
+      return
+    }
+    if (e.key === 'Escape') { hideMention(); return }
+  }
   if (e.key === 'Enter') { e.preventDefault(); sendMessage() }
 })
+messageInput.addEventListener('input', updateMentionBox)
 sendBtn.addEventListener('click', sendMessage)
 imgBtn.addEventListener('click', () => imgInput.click())
 imgInput.addEventListener('change', () => {
