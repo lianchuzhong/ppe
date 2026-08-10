@@ -28,4 +28,4 @@ npm run build   # 生成 bundle.js
 
 ## 在线访问
 
-- https://lianchuzhong.github.io/succession/
+- https://lianchuzhong.github.io/ppe/

@@ -203,7 +203,8 @@ function startChat() {
 
 function onConnect() {
   if (!client) return
-  client.subscribe(topicFor('chat'))
+  client.subscribe(topicFor('reviewed'))
+  client.subscribe(topicFor('rejected'))
   client.subscribe(topicFor('presence') + '/+')
   announce()
   heartbeatTimer = setInterval(announce, HEARTBEAT_MS)
@@ -242,13 +243,35 @@ function onMessage(topic, payload) {
     handlePresence(topic, str)
     return
   }
-  if (topic === topicFor('chat')) {
+  if (topic === topicFor('rejected')) {
     try {
       const m = JSON.parse(str)
-      if (m && m.id && !seenIds.has(m.id)) {
-        seenIds.add(m.id)
-        messages.push(m)
-        renderChat()
+      if (m && m.id && m.sender === myName && seenIds.has(m.id)) {
+        const idx = messages.findIndex((x) => x.id === m.id)
+        if (idx !== -1) {
+          messages.splice(idx, 1)
+          seenIds.delete(m.id)
+          pushSys('你的消息已被管理员拒绝')
+        }
+      }
+    } catch (_) {}
+    return
+  }
+  if (topic === topicFor('reviewed')) {
+    try {
+      const m = JSON.parse(str)
+      if (m && m.id) {
+        if (seenIds.has(m.id)) {
+          const local = messages.find((x) => x.id === m.id)
+          if (local && local.awaitingReview) {
+            delete local.awaitingReview
+            renderChat()
+          }
+        } else {
+          seenIds.add(m.id)
+          messages.push(m)
+          renderChat()
+        }
       }
     } catch (_) {}
   }
@@ -334,6 +357,7 @@ async function publishMessage(extra) {
   }
   messages.push(wire)
   seenIds.add(wire.id)
+  wire.awaitingReview = true
   if (cryptoKey) decryptedCache.set(wire.id, extra)
   client.publish(topicFor('chat'), JSON.stringify(wire), { qos: 0 })
   renderChat()
@@ -513,7 +537,7 @@ function renderMessageNode(m) {
   wrap.className = 'msg ' + (mine ? 'mine' : 'other')
   const meta = document.createElement('div')
   meta.className = 'meta'
-  meta.textContent = `${m.sender} · ${timeStr(m.t)}`
+  meta.textContent = `${m.sender} · ${timeStr(m.t)}${m.awaitingReview ? ' · 待审核' : ''}`
   wrap.appendChild(meta)
   const c = messageContent(m)
   if (c.img) {
