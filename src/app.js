@@ -18,7 +18,6 @@ const chatScreen = $('chat-screen')
 const loginError = $('login-error')
 const usernameInput = $('username')
 const roomInput = $('room')
-const passwordInput = $('password')
 const joinBtn = $('join-btn')
 const membersList = $('members-list')
 const memberCountEl = $('member-count')
@@ -41,9 +40,6 @@ let sysLog = []
 let messages = []
 let online = new Map()
 let lastSeen = new Map()
-let cryptoKey = null
-let decryptedCache = new Map()
-let decrypting = new Set()
 let seenIds = new Set()
 let mentionState = null
 let mentionItems = []
@@ -57,50 +53,6 @@ function uid() {
 
 function timeStr(t) {
   return new Date(t).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
-}
-
-function b64(buf) {
-  let bin = ''
-  for (const b of buf) bin += String.fromCharCode(b)
-  return btoa(bin)
-}
-
-function unb64(s) {
-  const bin = atob(s)
-  const out = new Uint8Array(bin.length)
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
-  return out
-}
-
-async function deriveKey(room, password) {
-  const pass = (password || '').trim()
-  if (!pass) return null
-  const enc = new TextEncoder()
-  const base = await crypto.subtle.importKey('raw', enc.encode(pass), 'PBKDF2', false, ['deriveKey'])
-  return crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt: enc.encode('succession-chat/' + room), iterations: 120000, hash: 'SHA-256' },
-    base,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt']
-  )
-}
-
-async function encryptData(obj) {
-  if (!cryptoKey) return null
-  const iv = crypto.getRandomValues(new Uint8Array(12))
-  const buf = new TextEncoder().encode(JSON.stringify(obj))
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, buf)
-  return { iv: b64(iv), data: b64(new Uint8Array(ct)) }
-}
-
-async function decryptData(m) {
-  try {
-    const iv = unb64(m.iv)
-    const ct = unb64(m.data)
-    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, cryptoKey, ct)
-    return JSON.parse(new TextDecoder().decode(pt))
-  } catch (_) { return null }
 }
 
 const WORDS = ('ahead amber apple atlas bacon badge baker bamboo beacon bear berry birch bliss bloom ' +
@@ -118,18 +70,6 @@ const WORDS = ('ahead amber apple atlas bacon badge baker bamboo beacon bear ber
   'skunk slate smoke snow sock spark sparrow spice spider spring squash squirrel stone storm sugar ' +
   'sunrise sunset swift tangerine teal tiger timber toast tomato topaz torch trail tulip turtle valley ' +
   'velvet violet walnut wander water willow wind winter wolf zebra zephyr').split(' ')
-
-function randInt(max) {
-  const arr = new Uint32Array(1)
-  crypto.getRandomValues(arr)
-  return arr[0] % max
-}
-
-function randomPassphrase() {
-  const w = []
-  for (let i = 0; i < 4; i++) w.push(WORDS[randInt(WORDS.length)])
-  return w.join('-') + '-' + (100 + randInt(900))
-}
 
 function topicFor(kind) {
   return ROOM_PREFIX + room + '/' + kind
@@ -175,12 +115,6 @@ function startChat() {
   roomTitle.textContent = room
   messageInput.focus()
   setStatus('正在连接……', false)
-
-  deriveKey(room, passwordInput.value).then((key) => {
-    cryptoKey = key
-    if (key) setStatus('正在连接…… · 消息已加密', false)
-    else setStatus('正在连接……（未加密）', false)
-  })
 
   client = mqtt.connect(BROKERS[0], {
     clientId: 'succ-' + myClientId,
@@ -347,18 +281,10 @@ async function sendMessage() {
 
 async function publishMessage(extra) {
   const base = { id: uid(), sender: myName, t: Date.now() }
-  let wire
-  if (cryptoKey) {
-    const enc = await encryptData(extra)
-    if (!enc) return
-    wire = Object.assign(base, { iv: enc.iv, data: enc.data })
-  } else {
-    wire = Object.assign(base, extra)
-  }
+  const wire = Object.assign(base, extra)
   messages.push(wire)
   seenIds.add(wire.id)
   wire.awaitingReview = true
-  if (cryptoKey) decryptedCache.set(wire.id, extra)
   client.publish(topicFor('chat'), JSON.stringify(wire), { qos: 0 })
   renderChat()
 }
@@ -422,25 +348,7 @@ function renderChat() {
 function messageContent(m) {
   if (m.img != null) return { img: m.img }
   if (m.text != null) return { text: m.text }
-  if (m.data) {
-    if (decryptedCache.has(m.id)) {
-      const d = decryptedCache.get(m.id)
-      return d ? d : { failed: true }
-    }
-    decryptAsync(m)
-    return { pending: true }
-  }
   return { text: '' }
-}
-
-async function decryptAsync(m) {
-  if (decrypting.has(m.id)) return
-  decrypting.add(m.id)
-  let d = null
-  if (cryptoKey) d = await decryptData(m)
-  decryptedCache.set(m.id, d)
-  decrypting.delete(m.id)
-  renderChat()
 }
 
 function updateMentionBox() {
@@ -573,9 +481,7 @@ function renderMessageNode(m) {
   } else {
     const bubble = document.createElement('div')
     bubble.className = 'bubble'
-    if (c.failed) bubble.textContent = '[加密消息 · 密码不匹配，无法解密]'
-    else if (c.pending) bubble.textContent = '正在解密…'
-    else bubble.appendChild(renderTextWithMentions(c.text))
+    bubble.appendChild(renderTextWithMentions(c.text))
     wrap.appendChild(bubble)
   }
   return wrap
@@ -608,9 +514,6 @@ function teardown() {
   messages = []
   online = new Map()
   lastSeen = new Map()
-  cryptoKey = null
-  decryptedCache = new Map()
-  decrypting = new Set()
   seenIds = new Set()
   hideMention()
   messageInput.value = ''
@@ -629,17 +532,6 @@ function toast(msg) {
 }
 
 joinBtn.addEventListener('click', startChat)
-$('gen-btn').addEventListener('click', () => {
-  const p = randomPassphrase()
-  passwordInput.value = p
-  try { navigator.clipboard.writeText(p) } catch (_) {}
-  toast('已生成随机口令并复制，请分享给群成员')
-})
-$('show-btn').addEventListener('click', () => {
-  const shown = passwordInput.type === 'text'
-  passwordInput.type = shown ? 'password' : 'text'
-  $('show-btn').textContent = shown ? '👁' : '🙈'
-})
 leaveBtn.addEventListener('click', () => {
   teardown()
   loginScreen.classList.remove('hidden')

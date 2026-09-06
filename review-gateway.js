@@ -11,6 +11,38 @@ const BROKERS = [
 ]
 const ROOM_PREFIX = 'succession/'
 const PORT = 8899
+
+let GITHUB_TOKEN = process.env.GITHUB_TOKEN || ''
+const GITHUB_REPO = 'lianchuzhong/ppe'
+
+try {
+  const config = JSON.parse(fs.readFileSync(path.join(DESKTOP, 'ppe', 'config.json'), 'utf8'))
+  if (config.GITHUB_TOKEN) GITHUB_TOKEN = config.GITHUB_TOKEN
+} catch (_) {}
+
+async function notifyGitHub(message) {
+  const title = `新咨询留言 - ${message.sender} (${new Date(message.t).toLocaleString('zh-CN')})`
+  const body = `## 用户咨询留言\n\n- **发送者**: ${message.sender}\n- **时间**: ${new Date(message.t).toLocaleString('zh-CN')}\n- **房间**: ${message.room || 'global'}\n\n### 内容\n${message.text || '[图片]'}`
+
+  try {
+    const res = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/issues`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `token ${GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ title, body }),
+    })
+    if (res.ok) {
+      console.log(`[GitHub通知] 已创建 Issue: ${title}`)
+    } else {
+      console.log(`[GitHub通知] 创建失败: ${res.status}`)
+    }
+  } catch (e) {
+    console.log(`[GitHub通知] 错误: ${e.message}`)
+  }
+}
 const DESKTOP = path.join(os.homedir(), 'Desktop')
 const ROOT = path.join(DESKTOP, '聊天审核')
 const DIRS = {
@@ -104,6 +136,7 @@ function connectAll() {
         fs.writeFileSync(filePath('pending', m.id), JSON.stringify(record, null, 2))
       } catch (_) {}
       console.log(`[待审] ${room} ${m.sender}: ${textPreview(m)}`)
+      notifyGitHub({ ...m, room })
     })
     c.on('error', () => {})
     c.on('close', () => console.log('断开: ' + url))
