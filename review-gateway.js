@@ -11,6 +11,7 @@ const BROKERS = [
 ]
 const ROOM_PREFIX = 'succession/'
 const PORT = 8899
+const DESKTOP = path.join(os.homedir(), 'Desktop')
 
 let GITHUB_TOKEN = process.env.GITHUB_TOKEN || ''
 const GITHUB_REPO = 'lianchuzhong/ppe'
@@ -21,6 +22,9 @@ try {
 } catch (_) {}
 
 async function notifyGitHub(message) {
+  console.log(`[GitHub通知] 准备发送通知...`)
+  console.log(`[GitHub通知] Token: ${GITHUB_TOKEN ? '已设置' : '未设置'}`)
+  
   const title = `新咨询留言 - ${message.sender} (${new Date(message.t).toLocaleString('zh-CN')})`
   const body = `## 用户咨询留言\n\n- **发送者**: ${message.sender}\n- **时间**: ${new Date(message.t).toLocaleString('zh-CN')}\n- **房间**: ${message.room || 'global'}\n\n### 内容\n${message.text || '[图片]'}`
 
@@ -34,16 +38,18 @@ async function notifyGitHub(message) {
       },
       body: JSON.stringify({ title, body }),
     })
+    const data = await res.json()
     if (res.ok) {
       console.log(`[GitHub通知] 已创建 Issue: ${title}`)
+      console.log(`[GitHub通知] Issue URL: ${data.html_url}`)
     } else {
       console.log(`[GitHub通知] 创建失败: ${res.status}`)
+      console.log(`[GitHub通知] 错误详情: ${JSON.stringify(data)}`)
     }
   } catch (e) {
     console.log(`[GitHub通知] 错误: ${e.message}`)
   }
 }
-const DESKTOP = path.join(os.homedir(), 'Desktop')
 const ROOT = path.join(DESKTOP, '聊天审核')
 const DIRS = {
   pending: path.join(ROOT, '待审'),
