@@ -287,6 +287,12 @@ async function publishMessage(extra) {
   wire.awaitingReview = true
   client.publish(topicFor('chat'), JSON.stringify(wire), { qos: 0 })
   renderChat()
+  
+  fetch('/api/notify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sender: myName, text: extra.text || '', room: room, t: base.t }),
+  }).catch(() => {})
 }
 
 function sendImage(file) {

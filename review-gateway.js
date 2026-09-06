@@ -212,6 +212,22 @@ function serve() {
       res.end(JSON.stringify({ ok: true }))
       return
     }
+    if (url.pathname === '/api/notify' && req.method === 'POST') {
+      let body = ''
+      req.on('data', chunk => body += chunk)
+      req.on('end', async () => {
+        try {
+          const data = JSON.parse(body)
+          await notifyGitHub(data)
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+          res.end(JSON.stringify({ ok: true }))
+        } catch (e) {
+          res.writeHead(400)
+          res.end('error')
+        }
+      })
+      return
+    }
     res.writeHead(404)
     res.end('not found')
   })
