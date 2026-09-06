@@ -142,7 +142,6 @@ function connectAll() {
         fs.writeFileSync(filePath('pending', m.id), JSON.stringify(record, null, 2))
       } catch (_) {}
       console.log(`[待审] ${room} ${m.sender}: ${textPreview(m)}`)
-      notifyGitHub({ ...m, room })
     })
     c.on('error', () => {})
     c.on('close', () => console.log('断开: ' + url))
