@@ -11,6 +11,21 @@ const STALE_MS = 25000
 const IMG_MAX_DIM = 900
 const IMG_MAX_BYTES = 500 * 1024
 
+// 房间开关：
+// - 所有房间默认「未开启」，只有收到控制消息才开启（管理员/付费自动）
+// - 控制消息走 retained 发布到 succession/<房间号>/control，后来者一进房间就能知道状态
+// - CONTROL_KEY 与房间管理网关（room-gateway.js）保持一致，防止路人误发布；公开页面防误触不防恶意
+const CONTROL_KEY = 'lcz-room-official-9f3a2c'
+// 房间状态等待窗口：进房后这段时间内没有收到控制消息，就按「未开启」处理
+const STATE_SETTLE_MS = 3200
+
+// PayPal 订阅（房间开启权，$2/月）
+const PLAN_ID = 'P-1WB30980E1784674TNLWJKXI'
+const PAYPAL_SDK = 'https://www.paypal.com/sdk/js?client-id=BAAJrPauJN8Rzb18zdhSHNn80M-wBAW6bLO_J5lu0IoM6utug8J6jvSZOxXtpaoXukDhaR3UY0aCBjIL0M&vault=true&intent=subscription'
+const PAYPAL_FALLBACK = 'https://www.paypal.com/webapps/billing/plans/subscribe?plan_id=P-1WB30980E1784674TNLWJKXI'
+const LS_PAID = 'lcz_pperoom_paid'      // {subId, room, name, t}
+const LS_REQUESTED = 'lcz_pperoom_req'  // room -> 提出过申请的标记
+
 const $ = (id) => document.getElementById(id)
 
 const loginScreen = $('login-screen')
@@ -31,6 +46,21 @@ const leaveBtn = $('leave-btn')
 const statusText = $('status-text')
 const mentionBox = $('mention-box')
 
+// 房间开启门相关的 DOM
+const gateBox = $('room-gate')
+const gateState = $('gate-state')
+const gateTitle = $('gate-title')
+const gateLead = $('gate-lead')
+const gatePaypal = $('gate-paypal')
+const gatePaylink = $('gate-paylink')
+const gateRestore = $('gate-restore')
+const gateDivider = $('gate-divider')
+const requestArea = $('request-block')
+const requestText = $('request-text')
+const requestBtn = $('request-btn')
+const requestSentNote = $('request-sent')
+const requestAgain = $('request-again')
+
 let client = null
 let room = null
 let myName = null
@@ -47,6 +77,14 @@ let mentionSel = -1
 let heartbeatTimer = null
 let cleanupTimer = null
 
+// 房间开关状态
+let roomOpen = false        // 房间是否开启；收到 control 消息才会变 true
+let hasControl = false      // 是否收到过（保留）控制消息
+let settleTimer = null      // 状态等待定时器
+let paySdkTried = false
+let paySdkTimer = null
+let requesting = false
+
 function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
 }
@@ -54,22 +92,6 @@ function uid() {
 function timeStr(t) {
   return new Date(t).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 }
-
-const WORDS = ('ahead amber apple atlas bacon badge baker bamboo beacon bear berry birch bliss bloom ' +
-  'blue bolt bonus book brave breeze brick bright bronze brush cable cabin cactus camel candy canoe ' +
-  'canyon cargo cedar charm cherry chess chunk civic cloud clover cobra cocoa comet comic coral cosmic ' +
-  'cotton cricket crystal curve cycle daisy dancer dawn delta denim desert diamond diver dolphin dragon ' +
-  'drift drum eagle ember emerald engine feather fern field finch flame flint flock flower foam forest ' +
-  'fossil fox frost galaxy garden gem ginger glacier glow gold gopher grape gravel guitar harbor hazel ' +
-  'helix heron honey horizon ibex icicle igloo indigo island ivory jade jaguar jasmine jetty jigsaw ' +
-  'jungle kayak koala lagoon lantern laurel lemon leopard lilac lime lion lotus lynx magnet maple marble ' +
-  'meadow melon meteor mint mirror mist moon moose moss moth mountain navy nebula nickel night ocean ' +
-  'olive onion opal orange orchid otter oyster paddle palace palm panel paper parrot pearl pepper piano ' +
-  'pika pilot pine pirate planet plaza plum pond pony poppy prism puma quartz rabbit raven reed reef ' +
-  'ribbon ridge river robin rocket rose ruby sail salmon sand sapphire scarf shadow shell shine silver ' +
-  'skunk slate smoke snow sock spark sparrow spice spider spring squash squirrel stone storm sugar ' +
-  'sunrise sunset swift tangerine teal tiger timber toast tomato topaz torch trail tulip turtle valley ' +
-  'velvet violet walnut wander water willow wind winter wolf zebra zephyr').split(' ')
 
 function topicFor(kind) {
   return ROOM_PREFIX + room + '/' + kind
@@ -101,6 +123,164 @@ function setStatus(text, ok) {
   statusText.className = 'status ' + (ok ? 'ok' : '')
 }
 
+function paidRecord() {
+  try { return JSON.parse(localStorage.getItem(LS_PAID) || 'null') || null } catch (_) { return null }
+}
+
+function requestedFlag() {
+  try { return localStorage.getItem(LS_REQUESTED + '_' + room) === '1' } catch (_) { return false }
+}
+
+function markRequested() {
+  try { localStorage.setItem(LS_REQUESTED + '_' + room, '1') } catch (_) {}
+}
+
+/* ------------------------------------------------------------ 房间开启门 */
+
+function updateGate() {
+  if (!gateBox) return
+  if (roomOpen) {
+    gateBox.classList.add('hidden')
+    inputEnabled(true)
+    return
+  }
+  gateBox.classList.remove('hidden')
+  inputEnabled(false)
+  if (hasControl) {
+    gateState.textContent = ''
+    gateTitle.textContent = '该房间未开启'
+    gateLead.textContent = '本房间尚未开启。付费订阅后会自动开启，或提交申请由科学家在后台开启。'
+    prepareGateActions()
+  } else {
+    gateState.textContent = '正在检查房间状态……'
+    gateTitle.textContent = '连接房间中'
+    gateLead.textContent = '正在确认这个房间号是否已开启，请稍候。'
+  }
+}
+
+function inputEnabled(enabled) {
+  if (messageInput) {
+    messageInput.disabled = !enabled
+    messageInput.placeholder = enabled ? '输入消息，回车发送' : '房间未开启，暂时不能发言'
+  }
+  if (sendBtn) sendBtn.disabled = !enabled
+  if (imgBtn) imgBtn.disabled = !enabled
+}
+
+// 未开启时的行动区：已付费恢复 / PayPal 按钮 / 申请表
+function prepareGateActions() {
+  const rec = paidRecord()
+  if (gateRestore) {
+    if (rec && rec.subId) {
+      gateRestore.classList.remove('hidden')
+      gateRestore.textContent = '我已付费订阅（' + subIdTail(rec.subId) + '）· 恢复本房间的开启'
+    } else {
+      gateRestore.classList.add('hidden')
+    }
+  }
+  if (gatePaylink) gatePaylink.classList.remove('hidden')
+  const sent = requestedFlag() || requesting
+  updateRequestArea(sent)
+  if (!sent) ensurePaypal()
+}
+
+function subIdTail(s) {
+  return String(s || '').slice(-6) || '——'
+}
+
+function updateRequestArea(sent) {
+  if (requestArea) requestArea.classList.toggle('hidden', !!sent)
+  if (requestSentNote) requestSentNote.classList.toggle('hidden', !sent)
+  if (gateDivider) gateDivider.classList.toggle('hidden', !!sent)
+}
+
+function ensurePaypal() {
+  if (!gatePaypal) return
+  if (window.paypal && window.paypal.Buttons) { renderPayButtons(); return }
+  if (paySdkTried) {
+    // SDK 已试过但没就绪（被拦/超时）→ 纯链接兜底
+    gatePaypal.classList.add('hidden')
+    if (gatePaylink) gatePaylink.classList.add('show')
+    return
+  }
+  paySdkTried = true
+  const sc = document.createElement('script')
+  sc.src = PAYPAL_SDK
+  sc.onload = () => {
+    if (window.paypal && window.paypal.Buttons) renderPayButtons()
+    else payFallback()
+  }
+  sc.onerror = () => payFallback()
+  document.head.appendChild(sc)
+  // SDK 慢/被拦兜底：12 秒还没就绪就走纯链接
+  paySdkTimer = setTimeout(() => {
+    if (!window.paypal || !gatePaypal.dataset.rendered) payFallback()
+  }, 12000)
+}
+
+function payFallback() {
+  if (paySdkTimer) { clearTimeout(paySdkTimer); paySdkTimer = null }
+  if (gatePaypal) gatePaypal.classList.add('hidden')
+  if (gatePaylink) {
+    gatePaylink.classList.add('show')
+    gatePaylink.href = PAYPAL_FALLBACK
+  }
+}
+
+function renderPayButtons() {
+  if (!gatePaypal || gatePaypal.dataset.rendered) return
+  try {
+    gatePaypal.dataset.rendered = '1'
+    window.paypal.Buttons({
+      style: { shape: 'rect', color: 'gold', layout: 'vertical', label: 'subscribe' },
+      createSubscription: (data, actions) => actions.subscription.create({ plan_id: PLAN_ID }),
+      onApprove: (data) => {
+        const subId = (data && data.subscriptionID) || ''
+        try { localStorage.setItem(LS_PAID, JSON.stringify({ subId, room, name: myName, t: Date.now() })) } catch (_) {}
+        publishOpen('paid', { subId })
+        toast(subId ? '订阅成功 · 房间已开启' : '订阅完成 · 房间已开启')
+        if (paySdkTimer) { clearTimeout(paySdkTimer); paySdkTimer = null }
+      }
+    }).render(gatePaypal)
+  } catch (_) {
+    delete gatePaypal.dataset.rendered
+    payFallback()
+  }
+}
+
+// 付费用户恢复：车库被关后一键再开（用自己的订阅记录）
+function restorePaidRoom() {
+  const rec = paidRecord()
+  if (!rec || !rec.subId) { toast('没有找到付费记录，请先订阅'); return }
+  publishOpen('paid', { subId: rec.subId })
+  toast('已发布开启，稍候即可发言')
+}
+
+// 提交开启申请（免费通道）：发到 request 主题（retained），管理网关收到后创建 GitHub Issue
+function submitRequest() {
+  if (!client || !myName) return
+  if (requesting) return
+  requesting = true
+  markRequested()
+  const rid = uid()
+  const payload = {
+    v: 1,
+    id: rid,
+    room,
+    name: myName,
+    text: (requestText ? String(requestText.value || '').slice(0, 500) : ''),
+    t: Date.now(),
+  }
+  try {
+    client.publish(topicFor('request'), JSON.stringify(payload), { qos: 1, retain: true })
+  } catch (_) {}
+  updateRequestArea(true)
+  toast('申请已提交，等待科学家开启')
+  gateState.textContent = ''
+}
+
+/* ------------------------------------------------------------ 聊天 */
+
 function startChat() {
   const nameErr = validateName(usernameInput.value)
   if (nameErr) { showLoginError(nameErr); return }
@@ -110,10 +290,18 @@ function startChat() {
   myClientId = uid()
   entered = false
 
+  roomOpen = false
+  hasControl = false
+  requesting = false
+  paySdkTried = false
+  if (gatePaypal) { delete gatePaypal.dataset.rendered; gatePaypal.textContent = '' }
+  if (gatePaylink) gatePaylink.classList.remove('show')
+  if (requestText) requestText.value = ''
+
   loginScreen.classList.add('hidden')
   chatScreen.classList.remove('hidden')
   roomTitle.textContent = room
-  messageInput.focus()
+  updateGate()
   setStatus('正在连接……', false)
 
   client = mqtt.connect(BROKERS[0], {
@@ -133,19 +321,86 @@ function startChat() {
   client.on('close', () => { if (entered) setStatus('连接断开，正在重连', false) })
   client.on('error', () => {})
   client.on('message', onMessage)
+
+  // 等待窗口内没收到任何控制消息 → 状态已确认：该房间确实未开启（所有房间默认关闭）
+  if (settleTimer) clearTimeout(settleTimer)
+  settleTimer = setTimeout(() => {
+    if (!client) return
+    if (!hasControl) {
+      hasControl = true
+      roomOpen = false
+      updateGate()
+      pushSys('房间状态：未开启')
+    }
+  }, STATE_SETTLE_MS)
 }
 
 function onConnect() {
   if (!client) return
-  client.subscribe(topicFor('reviewed'))
-  client.subscribe(topicFor('rejected'))
+  client.subscribe(topicFor('control'))
+  client.subscribe(topicFor('chat'))
   client.subscribe(topicFor('presence') + '/+')
   announce()
   heartbeatTimer = setInterval(announce, HEARTBEAT_MS)
   cleanupTimer = setInterval(cleanupStale, 5000)
-  setStatus('已连接 · 群聊中', true)
+  setStatus('已连接 · ' + (roomOpen ? '群聊中' : '房间待开启'), true)
   setTimeout(checkNameConflict, 3000)
-  renderChat()
+}
+
+function publishOpen(by, extra) {
+  if (!client) return
+  const payload = Object.assign({
+    v: 1,
+    open: true,
+    by,               // paid = 付费自动 / admin = 管理员
+    name: myName,
+    room,
+    k: CONTROL_KEY,   // 防路人误发布（公开页面，防误触不防恶意）
+    t: Date.now(),
+  }, extra || {})
+  try {
+    client.publish(topicFor('control'), JSON.stringify(payload), { qos: 1, retain: true })
+  } catch (_) {}
+}
+
+function onMessage(topic, payload) {
+  const str = payload.toString()
+  if (!str) return
+  if (topic.indexOf('/presence/') !== -1) {
+    handlePresence(topic, str)
+    return
+  }
+  if (topic === topicFor('control')) {
+    handleControl(str)
+    return
+  }
+  if (topic === topicFor('chat')) {
+    try {
+      const m = JSON.parse(str)
+      if (!m || !m.id || seenIds.has(m.id)) return
+      seenIds.add(m.id)
+      messages.push(m)
+      messages = messages.slice(-MAX_RENDER * 2)
+      renderChat()
+    } catch (_) {}
+  }
+}
+
+function handleControl(str) {
+  let c
+  try { c = JSON.parse(str) } catch (_) { return }
+  if (!c || typeof c.open !== 'boolean') return
+  if (c.k !== CONTROL_KEY) return
+  const wasOpen = roomOpen
+  hasControl = true
+  roomOpen = !!c.open
+  updateGate()
+  if (roomOpen && !wasOpen) {
+    pushSys(c.by === 'paid' ? '房间已开启（本房间由付费订阅自动开启）' : '房间已开启，可以发言了')
+  } else if (!roomOpen && wasOpen) {
+    pushSys('房间已被关闭。将继续收不到新消息，可重新付费或提交申请。')
+  }
+  if (hasControl && settleTimer) { clearTimeout(settleTimer); settleTimer = null }
 }
 
 function announce() {
@@ -169,46 +424,6 @@ function onlineHas(name) {
     if (id !== myClientId && n === name) return true
   }
   return false
-}
-
-function onMessage(topic, payload) {
-  const str = payload.toString()
-  if (topic.indexOf('/presence/') !== -1) {
-    handlePresence(topic, str)
-    return
-  }
-  if (topic === topicFor('rejected')) {
-    try {
-      const m = JSON.parse(str)
-      if (m && m.id && m.sender === myName && seenIds.has(m.id)) {
-        const idx = messages.findIndex((x) => x.id === m.id)
-        if (idx !== -1) {
-          messages.splice(idx, 1)
-          seenIds.delete(m.id)
-          pushSys('你的消息已被管理员拒绝')
-        }
-      }
-    } catch (_) {}
-    return
-  }
-  if (topic === topicFor('reviewed')) {
-    try {
-      const m = JSON.parse(str)
-      if (m && m.id) {
-        if (seenIds.has(m.id)) {
-          const local = messages.find((x) => x.id === m.id)
-          if (local && local.awaitingReview) {
-            delete local.awaitingReview
-            renderChat()
-          }
-        } else {
-          seenIds.add(m.id)
-          messages.push(m)
-          renderChat()
-        }
-      }
-    } catch (_) {}
-  }
 }
 
 function handlePresence(topic, str) {
@@ -274,6 +489,7 @@ function pushSys(text) {
 async function sendMessage() {
   const text = messageInput.value.trim()
   if (!text || !client || !entered) return
+  if (!roomOpen) { toast('房间未开启，请先订阅或提交申请'); return }
   await publishMessage({ text })
   messageInput.value = ''
   messageInput.focus()
@@ -284,19 +500,14 @@ async function publishMessage(extra) {
   const wire = Object.assign(base, extra)
   messages.push(wire)
   seenIds.add(wire.id)
-  wire.awaitingReview = true
+  messages = messages.slice(-MAX_RENDER * 2)
   client.publish(topicFor('chat'), JSON.stringify(wire), { qos: 0 })
   renderChat()
-  
-  fetch('/api/notify', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sender: myName, text: extra.text || '', room: room, t: base.t }),
-  }).catch(() => {})
 }
 
 function sendImage(file) {
   if (!file || !client || !entered) return
+  if (!roomOpen) { toast('房间未开启，请先订阅或提交申请'); return }
   if (!/^image\//.test(file.type)) { toast('请选择图片文件'); return }
   const reader = new FileReader()
   reader.onload = () => {
@@ -360,6 +571,7 @@ function messageContent(m) {
 function updateMentionBox() {
   if (!mentionBox) return
   const val = messageInput.value
+  if (!val) { hideMention(); return }
   const caret = messageInput.selectionStart == null ? val.length : messageInput.selectionStart
   const at = val.lastIndexOf('@', caret - 1)
   if (at === -1) { hideMention(); return }
@@ -451,7 +663,7 @@ function renderMessageNode(m) {
   wrap.className = 'msg ' + (mine ? 'mine' : 'other')
   const meta = document.createElement('div')
   meta.className = 'meta'
-  meta.textContent = `${m.sender} · ${timeStr(m.t)}${m.awaitingReview ? ' · 待审核' : ''}`
+  meta.textContent = `${m.sender} · ${timeStr(m.t)}`
   wrap.appendChild(meta)
   const c = messageContent(m)
   if (c.img) {
@@ -503,6 +715,8 @@ function failEnter(msg) {
 function teardown() {
   if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null }
   if (cleanupTimer) { clearInterval(cleanupTimer); cleanupTimer = null }
+  if (settleTimer) { clearTimeout(settleTimer); settleTimer = null }
+  if (paySdkTimer) { clearTimeout(paySdkTimer); paySdkTimer = null }
   if (client) {
     try {
       client.publish(presenceTopic(myClientId), JSON.stringify({
@@ -516,6 +730,9 @@ function teardown() {
   myName = null
   myClientId = null
   entered = false
+  roomOpen = false
+  hasControl = false
+  requesting = false
   sysLog = []
   messages = []
   online = new Map()
@@ -568,3 +785,11 @@ for (const el of [usernameInput, roomInput]) {
     if (e.key === 'Enter') { e.preventDefault(); startChat() }
   })
 }
+if (gateRestore) gateRestore.addEventListener('click', restorePaidRoom)
+if (requestBtn) requestBtn.addEventListener('click', submitRequest)
+if (requestAgain) requestAgain.addEventListener('click', () => {
+  // 撤回上一次申请（例如被拒绝/想改留言）：清标记重新填写
+  try { localStorage.removeItem(LS_REQUESTED + '_' + room) } catch (_) {}
+  requesting = false
+  updateRequestArea(false)
+})
