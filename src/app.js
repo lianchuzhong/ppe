@@ -23,6 +23,8 @@ const STATE_SETTLE_MS = 3200
 const PLAN_ID = 'P-1WB30980E1784674TNLWJKXI'
 const PAYPAL_SDK = 'https://www.paypal.com/sdk/js?client-id=BAAJrPauJN8Rzb18zdhSHNn80M-wBAW6bLO_J5lu0IoM6utug8J6jvSZOxXtpaoXukDhaR3UY0aCBjIL0M&vault=true&intent=subscription'
 const PAYPAL_FALLBACK = 'https://www.paypal.com/webapps/billing/plans/subscribe?plan_id=P-1WB30980E1784674TNLWJKXI'
+// 多网站支持者校验（同一订阅在短视频站也有效）
+const SUP_STATUS_API = 'https://lcz-video-alerts.lcz-video-alerts.workers.dev'
 const LS_PAID = 'lcz_pperoom_paid'      // {subId, room, name, t}
 const LS_REQUESTED = 'lcz_pperoom_req'  // room -> 提出过申请的标记
 
@@ -60,6 +62,11 @@ const requestText = $('request-text')
 const requestBtn = $('request-btn')
 const requestSentNote = $('request-sent')
 const requestAgain = $('request-again')
+// 凭订阅号恢复（跨设备 / 在短视频等其他网站订阅的都可恢复）
+const gateSublink = $('gate-sublink')
+const gateSubrow = $('gate-subrow')
+const gateSubinput = $('gate-subinput')
+const gateSubbtn = $('gate-subbtn')
 
 let client = null
 let room = null
@@ -178,6 +185,7 @@ function prepareGateActions() {
       gateRestore.classList.add('hidden')
     }
   }
+  if (gateSublink) gateSublink.classList.remove('hidden')
   if (gatePaylink) gatePaylink.classList.remove('hidden')
   const sent = requestedFlag() || requesting
   updateRequestArea(sent)
@@ -186,6 +194,32 @@ function prepareGateActions() {
 
 function subIdTail(s) {
   return String(s || '').slice(-6) || '——'
+}
+
+// 凭订阅号恢复：换设备 / 在短视频站订阅过的，输入 I-xxxxx 校验通过即开房
+async function restoreBySubId() {
+  const v = String(gateSubinput ? gateSubinput.value : '').trim()
+  if (!v) { toast('请输入 PayPal 订阅号'); return }
+  if (!/^I-[A-Za-z0-9-]{6,40}$/.test(v)) { toast('订阅号形如 I-xxxxxxxx，请到 PayPal 订阅记录里复制'); return }
+  if (gateSubbtn) gateSubbtn.disabled = true
+  toast('校验订阅中……')
+  try {
+    const r = await fetch(SUP_STATUS_API + '/api/support/status?sub=' + encodeURIComponent(v), { credentials: 'omit' })
+    const j = await r.json().catch(() => ({}))
+    if (r.ok && j.ok && j.active) {
+      try { localStorage.setItem(LS_PAID, JSON.stringify({ subId: v, room, name: myName, t: Date.now() })) } catch (_) {}
+      publishOpen('paid', { subId: v })
+      if (gateSubrow) gateSubrow.classList.add('hidden')
+      toast('订阅有效 · 房间已开启')
+    } else if (r.ok && j.ok) {
+      toast('这个订阅号不在有效订阅中（' + (j.status || '已失效') + '）')
+    } else {
+      toast('订阅校验服务器还没接通（' + (j.error || 'unknown') + '），稍后再试')
+    }
+  } catch (_) {
+    toast('订阅校验服务器不可达，稍后再试')
+  }
+  if (gateSubbtn) gateSubbtn.disabled = false
 }
 
 function updateRequestArea(sent) {
@@ -787,6 +821,14 @@ for (const el of [usernameInput, roomInput]) {
 }
 if (gateRestore) gateRestore.addEventListener('click', restorePaidRoom)
 if (requestBtn) requestBtn.addEventListener('click', submitRequest)
+if (gateSublink) gateSublink.addEventListener('click', (e) => {
+  e.preventDefault()
+  if (gateSubrow) gateSubrow.classList.toggle('hidden')
+})
+if (gateSubbtn) gateSubbtn.addEventListener('click', restoreBySubId)
+if (gateSubinput) gateSubinput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); restoreBySubId() }
+})
 if (requestAgain) requestAgain.addEventListener('click', () => {
   // 撤回上一次申请（例如被拒绝/想改留言）：清标记重新填写
   try { localStorage.removeItem(LS_REQUESTED + '_' + room) } catch (_) {}

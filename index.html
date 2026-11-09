@@ -264,6 +264,33 @@
     }
     #gate-paylink:hover { background: #fff7e0; }
     #gate-paylink.show { display: block; }
+    #gate-sublink {
+      display: block;
+      width: 100%;
+      text-align: center;
+      font-size: 12px;
+      color: var(--muted);
+      text-decoration: underline;
+      cursor: pointer;
+      margin: 10px 0 2px;
+    }
+    #gate-sublink:hover { color: var(--text); }
+    #gate-subrow {
+      display: flex;
+      gap: 8px;
+      margin: 8px 0 4px;
+    }
+    #gate-subinput {
+      flex: 1;
+      min-width: 0;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 13px;
+      font-family: inherit;
+      outline: none;
+    }
+    #gate-subinput:focus { border-color: var(--accent); }
     #gate-divider {
       display: flex;
       align-items: center;
@@ -393,6 +420,11 @@
             <button id="gate-restore" type="button" class="btn hidden">我已付费订阅 · 恢复本房间的开启</button>
             <div id="gate-paypal"></div>
             <a id="gate-paylink" class="paylink-fallback" href="https://www.paypal.com/webapps/billing/plans/subscribe?plan_id=P-1WB30980E1784674TNLWJKXI" target="_blank" rel="noopener">💰 在 PayPal 打开订阅页面（$2/月）</a>
+            <a id="gate-sublink" class="hidden" href="javascript:void(0)">凭订阅号恢复 · 换设备 / 在短视频站订阅的也能用</a>
+            <div id="gate-subrow" class="hidden">
+              <input id="gate-subinput" type="text" maxlength="48" placeholder="PayPal 订阅号，形如 I-xxxxxxxx" autocomplete="off">
+              <button id="gate-subbtn" type="button" class="btn">校验并开房</button>
+            </div>
             <div id="gate-divider" class="hidden"><span>或（免费通道）</span></div>
             <div id="request-block" class="hidden">
               <label for="request-text">向科学家提交开启申请（无需付费）</label>
@@ -411,6 +443,6 @@
   </div>
 
   <div id="toast"></div>
-  <script src="./bundle.js?v=8"></script>
+  <script src="./bundle.js?v=9"></script>
 </body>
 </html>
