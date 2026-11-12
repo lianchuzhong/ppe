@@ -28,8 +28,12 @@ const BROKERS = [
   'wss://broker.emqx.io:8084/mqtt',
   'wss://broker.hivemq.com:8884/mqtt',
 ]
-const ROOM_PREFIX = 'succession/'
-const PORT = 8899
+// LCZ_PFX / LCZ_PORT 仅测试期使用：换主题前缀/端口，避免测试流量打进生产订阅
+const ROOM_PREFIX = (() => {
+  const p = String(process.env.LCZ_PFX || 'succession/')
+  return p.endsWith('/') ? p : p + '/'
+})()
+const PORT = Math.max(1024, parseInt(process.env.LCZ_PORT || '8899', 10) || 8899)
 const LOCAL_BASE = 'http://127.0.0.1:' + PORT
 // 主站点仓库（旧版兼容：不再往这里建 issue）
 const PUBLIC_REPO = 'lianchuzhong/ppe'
@@ -84,7 +88,7 @@ function privateEnabled() {
 }
 
 /* ------------------------------------------------------------ 本机状态 */
-let state = { requests: [], openRooms: [], processed: [] }
+let state = { requests: [], openRooms: [], processed: [], knownRooms: [], visitIssue: null }
 let supporterIds = new Set()           // 已登记过的订阅号（首次付费才发通知 Issue）
 let lastRoomsHash = ''                 // 最近一次应用的私库 rooms.json 内容指纹（防自身回环）
 let roomsEtag = ''                     // If-None-Match
@@ -99,6 +103,8 @@ function loadState() {
       if (Array.isArray(s.requests)) state.requests = s.requests.filter(r => r && r.id && r.room)
       if (Array.isArray(s.openRooms)) state.openRooms = s.openRooms.filter(r => r && r.room)
       if (Array.isArray(s.processed)) state.processed = s.processed.filter(x => typeof x === 'string')
+      if (Array.isArray(s.knownRooms)) state.knownRooms = s.knownRooms.filter(x => typeof x === 'string')
+      if (s.visitIssue && s.visitIssue.number) state.visitIssue = { number: s.visitIssue.number, url: s.visitIssue.url || '', t: s.visitIssue.t || 0 }
       if (s.lastRoomsHash) { lastRoomsHash = s.lastRoomsHash }
     }
   } catch (_) {}
@@ -110,6 +116,8 @@ function persistState() {
       requests: state.requests,
       openRooms: state.openRooms,
       processed: state.processed,
+      knownRooms: state.knownRooms,
+      visitIssue: state.visitIssue,
       lastRoomsHash,
     }, null, 2), 'utf8')
   } catch (e) {
@@ -304,6 +312,108 @@ async function appendPrivateJsonl(p, obj) {
   return writePrivateFile(p, next, '审计: ' + (obj.act || obj.kind || 'event'))
 }
 
+/* ------------------------------------------------------------ 访客记录（一条长期 Issue，按批汇总） */
+
+const VISIT_TITLE = '📊 访客记录（自动汇总）'
+const VISIT_CID_TTL_MS = 30 * 60 * 1000   // 与页面端 cid 保鲜 30 分钟对齐：同一会话重复上报不重复计数
+const VISIT_SEEN_CAP = 4000               // 去重表容量兜底
+const VISIT_FLUSH_MS = 60 * 1000          // 攒批周期
+const VISIT_LINES_PER_COMMENT = 50        // 单条评论最多行数（防超长）
+
+let visitSeen = new Map()   // room|cid -> 最近一次出现时间
+let visitTotal = 0          // 本进程启动以来去重后的访客事件数（面板展示用）
+let visitRecent = []        // 最近事件（仅内存，面板展示）
+let visitBuffer = []        // 待写进 Issue 的记录
+let visitIssueEnsuring = null
+
+function handleVisit(room, str) {
+  let v
+  try { v = JSON.parse(str) } catch (_) { return }
+  if (!v || v.v !== 1) return
+  const cid = String(v.cid || '')
+  if (!/^[a-z0-9-]{6,64}$/.test(cid)) return
+  const t = Number(v.t) || 0
+  const now = Date.now()
+  // 发送端不是 retained，但保险仍做新鲜度校验（同 control 的 2 分钟窗口一致）
+  if (!t || t > now + 60000 || now - t > 120000) return
+  const key = room + '|' + cid
+  const seen = visitSeen.get(key)
+  if (seen && now - seen < VISIT_CID_TTL_MS) {
+    visitSeen.set(key, now)   // 同一会话继续在线：滚动保鲜，不重复计数
+    return
+  }
+  visitSeen.set(key, now)
+  if (visitSeen.size > VISIT_SEEN_CAP) {
+    const arr = [...visitSeen.entries()].sort((a, b) => a[1] - b[1])
+    for (let i = 0; i < Math.floor(arr.length / 2); i++) visitSeen.delete(arr[i][0])
+  }
+  visitTotal++
+  const label = room === '_meta' ? '主页' : '房间 ' + room
+  console.log('[访客] ' + label + ' · 会话 ' + cid.slice(-6))
+  auditLocal('visit', { room, cid: cid.slice(-6) })
+  visitRecent.unshift({ t: now, room: label, cid: cid.slice(-6) })
+  if (visitRecent.length > 30) visitRecent = visitRecent.slice(0, 30)
+  visitBuffer.push({ t: now, label, cid: cid.slice(-6) })
+  if (visitBuffer.length > 300) visitBuffer = visitBuffer.slice(-300)
+}
+
+// 长期汇总 Issue：状态里记过号就用它，否则搜现有开放 Issue（重启防重建），没有才新建
+async function ensureVisitIssue() {
+  if (state.visitIssue && state.visitIssue.number) return state.visitIssue
+  if (visitIssueEnsuring) return visitIssueEnsuring
+  visitIssueEnsuring = (async () => {
+    try {
+      const r = await ghFetch('/repos/' + PRIVATE_REPO + '/issues?state=open&per_page=100&sort=created&direction=asc')
+      if (r && r.ok) {
+        const list = await r.json()
+        const found = Array.isArray(list) ? list.find(it => String(it.title || '').indexOf(VISIT_TITLE) === 0) : null
+        if (found) {
+          state.visitIssue = { number: found.number, url: found.html_url || '', t: Date.now() }
+          persistState()
+          console.log('[访客] 复用已有汇总 Issue #' + found.number)
+          return state.visitIssue
+        }
+      }
+      const j = await createIssue(PRIVATE_REPO, VISIT_TITLE, [
+        '📊 **访客记录（自动汇总）**',
+        '',
+        '网关每分钟把新出现的访客（按浏览器会话去重）追加到本 Issue 的评论里。',
+        '- 「主页」= 只看过登录页、没进任何房间的访客；「房间 x」= 进过该房间的访客',
+        '- 「会话尾号」= 浏览器端随机 id 的尾 6 位（30 分钟内反复刷新视为同一次访问，不重复计数）',
+        '',
+        '> 本条请保持开放；若手动关闭，网关之后会再建一条新的汇总 Issue。',
+      ].join('\n'))
+      if (j && j.number) {
+        state.visitIssue = { number: j.number, url: j.html_url || '', t: Date.now() }
+        persistState()
+        console.log('[访客] 已创建汇总 Issue #' + j.number)
+        return state.visitIssue
+      }
+      return null
+    } finally {
+      visitIssueEnsuring = null
+    }
+  })()
+  return visitIssueEnsuring
+}
+
+async function flushVisitBuffer() {
+  if (!visitBuffer.length) return
+  if (!privateEnabled() || TEST_NO_ISSUES) { visitBuffer = []; return }   // 本地测试模式：只留本地审计
+  const issue = await ensureVisitIssue()
+  if (!issue || !issue.number) return    // 网络失败：留着本批下轮再试
+  const batch = visitBuffer.splice(0, VISIT_LINES_PER_COMMENT)
+  const lines = ['**本批 ' + batch.length + ' 条 · ' + fmtTime(batch[0].t) + '**', '']
+  for (const r of batch) lines.push('- ' + fmtTime(r.t) + ' · ' + r.label + ' · 会话尾号 ' + r.cid)
+  const r = await ghFetch('/repos/' + PRIVATE_REPO + '/issues/' + issue.number + '/comments', 'POST', { body: lines.join('\n') })
+  if (r && r.ok) {
+    console.log('[访客] 已汇总 ' + batch.length + ' 条 → Issue #' + issue.number)
+  } else {
+    visitBuffer = batch.concat(visitBuffer)   // 失败放回队首，下轮重试
+    console.log('[访客] 汇总失败' + (r ? ' http=' + r.status : '（网络）') + '，本批下轮重试')
+  }
+}
+
 /* ------------------------------------------------------------ 房间控制 */
 
 function publishControl(room, open, by, extra) {
@@ -330,6 +440,7 @@ function approveRoom(room, via) {
   auditLocal('open-room', { room, via: via || 'admin' })
   auditPrivate('open-room', { room, via: via || 'admin', by: 'admin' })
   syncRoomToPrivate(room, true, 'admin', via || 'admin')
+  if (changed) notifyNewRoom(room, via || 'admin').catch(e => console.log('[新房间] 失败: ' + (e && e.message)))
   return true
 }
 
@@ -360,6 +471,7 @@ function handlePaidOpen(room, payload) {
   auditPrivate('paid-open', { room, subId: String(payload.subId || '').slice(-6), by: 'paid' })
   if (payload.subId) notifyNewSupporter({ subId: payload.subId, room, name: payload.name || '', t: payload.t || Date.now() })
   syncRoomToPrivate(room, true, 'paid', 'subscriber')
+  notifyNewRoom(room, 'paid').catch(e => console.log('[新房间] 失败: ' + (e && e.message)))
 }
 
 async function handleControl(room, str) {
@@ -380,6 +492,7 @@ async function handleControl(room, str) {
         auditLocal('open-room', { room, via: 'mqtt', by: 'admin' })
         auditPrivate('open-room', { room, via: 'mqtt', by: 'admin' })
         syncRoomToPrivate(room, true, 'admin', 'mqtt')
+        notifyNewRoom(room, 'mqtt').catch(e => console.log('[新房间] 失败: ' + (e && e.message)))
       }
       resolveByRoom(room)
     }
@@ -464,6 +577,7 @@ async function applyRoomsMap(mapObj, src) {
         publishControl(room, true, 'paid')
         setOpen(room, 'paid')
         persistState()
+        markRoomKnown(room)   // 还原不是新开：静默标记，避免开机还原刷「新房间」Issue
         resolveByRoom(room)
       } else {
         console.log('[私库] 依据权威指令开启房间 ' + room + '（来自 ' + src + '）')
@@ -483,31 +597,89 @@ async function applyRoomsMap(mapObj, src) {
   }
 }
 
-// 面板/网关自己的开关动作 → 回写私库 rooms.json（让私库始终反映当前开关状态；私库键保留 note）
-async function syncRoomToPrivate(room, open, by, via) {
-  if (!privateEnabled()) return
-  try {
-    const cur = await readPrivateFile('rooms.json')
-    if (cur === null) return
-    let j = { rooms: {}, note: '' }
-    try { j = JSON.parse(cur.raw || '{}') || {} } catch (_) {}
-    if (!j.rooms || typeof j.rooms !== 'object') j.rooms = {}
-    j.rooms[room] = Object.assign({}, j.rooms[room] || {}, {
-      open: !!open,
-      by: by,
-      updated: new Date().toISOString(),
-      note: (j.rooms[room] && j.rooms[room].note) || '',
-      via: via || '',
-    })
-    // 写回前更新 lastRoomsHash 指纹，避免轮询把自己当新一轮指令
-    lastRoomsHash = sha1hex(JSON.stringify(j.rooms || {}))
-    persistState()
-    const ok = await writePrivateFile('rooms.json', JSON.stringify(j, null, 2),
-      '房间开关同步: ' + room + ' = ' + (open ? '开启' : '关闭') + '（' + (via || by) + '）')
-    if (!ok) console.log('[私库] sync rooms.json 失败')
-  } catch (e) {
-    console.log('[私库] syncRoomToPrivate 异常: ' + (e && e.message))
+/* ------------------------------------------------------------ 新房间通知（每个房号首次出现才建一条 Issue） */
+
+function markRoomKnown(room) {
+  if (state.knownRooms.includes(room)) return false
+  state.knownRooms.push(room)
+  if (state.knownRooms.length > 500) state.knownRooms = state.knownRooms.slice(-500)
+  persistState()
+  return true
+}
+
+async function notifyNewRoom(room, via) {
+  if (!room) return
+  if (!markRoomKnown(room)) return   // 老房号：不再打扰
+  const viaLabel = via === 'paid' ? '订阅者付费自动开启'
+    : via === 'mqtt' ? '管理员（MQTT 控制通道）'
+    : via === 'private-repo' ? '私库权威指令（rooms.json）'
+    : '管理员（' + (via || '面板') + '）'
+  console.log('[新房间] 房间 ' + room + ' 首次出现（' + (via || '未知') + '）')
+  auditLocal('new-room', { room, via: via || 'unknown' })
+  auditPrivate('new-room', { room, via: via || 'unknown' })
+  await createIssue(PRIVATE_REPO, '🆕 新房间开启：' + room, [
+    '房间号 `' + room + '` 首次开启。',
+    '',
+    '- **时间**：' + fmtTime(Date.now()),
+    '- **来源**：' + viaLabel,
+    '',
+    '> 付费开启的房间受保护不会自动关闭；同一房号只在本条 Issue 里通知这一次。',
+  ].join('\n'))
+}
+
+// 开机基线：openRooms + 私库 rooms.json 里已有的房号都标记为已知（不通知）
+async function seedKnownRooms() {
+  let added = 0
+  for (const it of state.openRooms || []) {
+    if (it && it.room && !state.knownRooms.includes(it.room)) { state.knownRooms.push(it.room); added++ }
   }
+  if (privateEnabled()) {
+    try {
+      const cur = await readPrivateFile('rooms.json')
+      if (cur && cur.raw) {
+        const j = JSON.parse(cur.raw || '{}') || {}
+        for (const key of Object.keys(j.rooms || {})) {
+          const room = sanitizeRoom(key)
+          if (room && !state.knownRooms.includes(room)) { state.knownRooms.push(room); added++ }
+        }
+      }
+    } catch (_) {}
+  }
+  if (state.knownRooms.length > 500) state.knownRooms = state.knownRooms.slice(-500)
+  if (added) persistState()
+  console.log('[新房间] 已有房号基线 ' + state.knownRooms.length + ' 个（此后房号新增才建 Issue）')
+}
+
+// 面板/网关自己的开关动作 → 回写私库 rooms.json（让私库始终反映当前开关状态；私库键保留 note）
+// 串行队列：开/关连续触发时防止「旧合并内容晚到覆盖新状态」的竞态（409 重试会保留原 body 内容）
+let syncPrivChain = Promise.resolve()
+function syncRoomToPrivate(room, open, by, via) {
+  if (!privateEnabled()) return Promise.resolve()
+  syncPrivChain = syncPrivChain.then(async () => {
+    try {
+      const cur = await readPrivateFile('rooms.json')
+      if (cur === null) { console.log('[私库] sync rooms.json 失败：读当前内容不可用'); return }
+      let j = { rooms: {}, note: '' }
+      try { j = JSON.parse(cur.raw || '{}') || {} } catch (_) {}
+      if (!j.rooms || typeof j.rooms !== 'object') j.rooms = {}
+      j.rooms[room] = Object.assign({}, j.rooms[room] || {}, {
+        open: !!open,
+        by: by,
+        updated: new Date().toISOString(),
+        note: (j.rooms[room] && j.rooms[room].note) || '',
+        via: via || '',
+      })
+      // 写回前更新 lastRoomsHash 指纹，避免轮询把自己当新一轮指令
+      lastRoomsHash = sha1hex(JSON.stringify(j.rooms || {}))
+      persistState()
+      const ok = await writePrivateFile('rooms.json', JSON.stringify(j, null, 2),
+        '房间开关同步: ' + room + ' = ' + (open ? '开启' : '关闭') + '（' + (via || by) + '）')
+      if (!ok) console.log('[私库] sync rooms.json 失败')
+    } catch (e) {
+      console.log('[私库] syncRoomToPrivate 异常: ' + (e && e.message))
+    }
+  }).catch(() => {})
+  return syncPrivChain
 }
 
 // 写私库审计：串行队列（防并发读旧内容互相覆盖），失败只记日志不影响本地
@@ -752,8 +924,9 @@ client.on('connect', () => {
     ROOM_PREFIX + '+/request',
     ROOM_PREFIX + '+/control',
     ROOM_PREFIX + '+/chat',
+    ROOM_PREFIX + '+/visit',
   ], { qos: 1 }, (err) => {
-    console.log(err ? '[MQTT] 订阅失败: ' + err.message : `[MQTT] 已订阅 ${ROOM_PREFIX}<房间>/{request,control,chat}（retained 会自动补收）`)
+    console.log(err ? '[MQTT] 订阅失败: ' + err.message : `[MQTT] 已订阅 ${ROOM_PREFIX}<房间>/{request,control,chat,visit}（retained 会自动补收）`)
   })
 })
 
@@ -774,6 +947,8 @@ client.on('message', (topic, payload) => {
     handleControl(room, str)
   } else if (kind === 'chat') {
     recordChat(room, str)
+  } else if (kind === 'visit') {
+    handleVisit(room, str)
   }
 })
 
@@ -806,6 +981,13 @@ function listData() {
     privateRepo: PRIVATE_REPO,
     chatArchive: CHAT_DIR,
     key: CONTROL_KEY,
+    visits: {
+      total: visitTotal,
+      issue: (state.visitIssue && state.visitIssue.number) || 0,
+      issueUrl: (state.visitIssue && state.visitIssue.url) || '',
+      knownRooms: state.knownRooms.length,
+      recent: visitRecent.slice(0, 10),
+    },
     pending: state.requests.map(r => ({
       id: r.id,
       room: r.room,
@@ -915,6 +1097,7 @@ async function refresh(){
     ' · 令牌 ' + (j.token ? '已配置' : '未配置') +
     (j.issues === 'off' ? ' · Issue 测试模式' : ' · Issue 通知开') +
     ' · 私库 ' + (j.privateOk ? '已连接' : '未连接') +
+    ' · 访客 ' + (j.visits ? j.visits.total : 0) +
     ' · 待处理 ' + j.pending.length + ' · 已开 ' + j.open.length;
   const pend = document.getElementById('pend');
   const open2 = document.getElementById('opens');
@@ -1022,6 +1205,10 @@ probePrivate().then(() => {
   // 私库权威轮询 + 聊天归档定时
   setInterval(() => { pollRooms().catch(e => console.log('[私库] 轮询异常: ' + (e && e.message))) }, POLL_SEC * 1000)
   setInterval(() => { archiveChat().catch(e => console.log('[归档] 异常: ' + (e && e.message))) }, ARCHIVE_SEC * 1000)
+  // 访客汇总定时（攒批 → 追加到长期 Issue 评论）
+  setInterval(() => { flushVisitBuffer().catch(e => console.log('[访客] 汇总异常: ' + (e && e.message))) }, VISIT_FLUSH_MS)
+  // 房号基线（openRooms + 私库 rooms.json）已经存在的不通知；此后房号首次出现才建 Issue
+  seedKnownRooms().catch(e => console.log('[新房间] 基线异常: ' + (e && e.message)))
   // 开机先归档一遍历史聊天（把之前没归的补上）
   try {
     if (fs.existsSync(CHAT_DIR)) {

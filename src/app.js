@@ -27,6 +27,9 @@ const PAYPAL_FALLBACK = 'https://www.paypal.com/webapps/billing/plans/subscribe?
 const SUP_STATUS_API = 'https://lcz-video-alerts.lcz-video-alerts.workers.dev'
 const LS_PAID = 'lcz_pperoom_paid'      // {subId, room, name, t}
 const LS_REQUESTED = 'lcz_pperoom_req'  // room -> 提出过申请的标记
+// 访客 beacon：浏览器会话随机 id，30 分钟内刷新视为同一访问（网关端也按它去重）
+const LS_VISIT_CID = 'lcz_pperoom_visit'
+const VISIT_CID_TTL = 30 * 60 * 1000
 
 const $ = (id) => document.getElementById(id)
 
@@ -140,6 +143,52 @@ function requestedFlag() {
 
 function markRequested() {
   try { localStorage.setItem(LS_REQUESTED + '_' + room, '1') } catch (_) {}
+}
+
+/* ------------------------------------------------------------ 访客 beacon */
+
+// 会话 id：localStorage 保存 30 分钟；过期就换新号（"同一访客"由网关按 cid+房间 去重）
+function ensureVisitCid() {
+  let rec = null
+  try { rec = JSON.parse(localStorage.getItem(LS_VISIT_CID) || 'null') } catch (_) { rec = null }
+  if (!rec || !rec.cid || !rec.t || Date.now() - rec.t > VISIT_CID_TTL) {
+    rec = { cid: uid() + uid().slice(0, 4), t: Date.now() }
+  } else {
+    rec.t = Date.now()
+  }
+  try { localStorage.setItem(LS_VISIT_CID, JSON.stringify(rec)) } catch (_) {}
+  return rec.cid
+}
+
+// 进房 beacon：分享聊天室的 MQTT 连接，非 retained（网关实时计数用）
+function publishRoomVisit() {
+  if (!client) return
+  try {
+    client.publish(ROOM_PREFIX + room + '/visit',
+      JSON.stringify({ v: 1, cid: ensureVisitCid(), t: Date.now() }), { qos: 1, retain: false })
+  } catch (_) {}
+}
+
+// 主页 beacon：登录页没有聊天连接，开一条一次性短连发布后立即关闭
+function noteHomeVisit() {
+  const cid = ensureVisitCid()
+  const c = mqtt.connect(BROKERS[0], {
+    clientId: 'vst-' + uid(),
+    reconnectPeriod: 0,      // 不重试：beacon 是尽力而为，失败不值得加重连负担
+    connectTimeout: 8000,
+    keepalive: 15,
+  })
+  let done = false
+  const finish = () => { if (done) return; done = true; try { c.end(true) } catch (_) {} }
+  c.on('connect', () => {
+    try {
+      c.publish(ROOM_PREFIX + '_meta/visit',
+        JSON.stringify({ v: 1, cid, t: Date.now() }), { qos: 1, retain: false })
+    } catch (_) {}
+    setTimeout(finish, 600)
+  })
+  c.on('error', finish)
+  c.on('close', finish)
 }
 
 /* ------------------------------------------------------------ 房间开启门 */
@@ -375,6 +424,7 @@ function onConnect() {
   client.subscribe(topicFor('chat'))
   client.subscribe(topicFor('presence') + '/+')
   announce()
+  publishRoomVisit()   // 进房访客记录（30 分钟会话去重在网关端）
   heartbeatTimer = setInterval(announce, HEARTBEAT_MS)
   cleanupTimer = setInterval(cleanupStale, 5000)
   setStatus('已连接 · ' + (roomOpen ? '群聊中' : '房间待开启'), true)
@@ -835,3 +885,6 @@ if (requestAgain) requestAgain.addEventListener('click', () => {
   requesting = false
   updateRequestArea(false)
 })
+
+// 主页访客记录：登录页所有人都会被打点（30 分钟同会话只在网关端计一次）
+noteHomeVisit()
